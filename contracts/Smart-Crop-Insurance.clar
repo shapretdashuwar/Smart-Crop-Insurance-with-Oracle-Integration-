@@ -505,3 +505,409 @@
         (ok true)
     )
 )
+(define-constant base-refund-rate u20)
+(define-constant loyalty-bonus-increment u5)
+(define-constant max-loyalty-bonus u15)
+
+(define-map policy-payments
+    { farmer: principal }
+    {
+        premium-paid: uint,
+        payment-block: uint,
+    }
+)
+
+(define-map farmer-loyalty
+    { farmer: principal }
+    {
+        consecutive-periods: uint,
+        total-refunds: uint,
+        last-refund-block: uint,
+    }
+)
+
+(define-map pending-refunds
+    { farmer: principal }
+    {
+        amount: uint,
+        eligible-block: uint,
+        claimed: bool,
+    }
+)
+
+(define-read-only (get-policy-payment (farmer principal))
+    (map-get? policy-payments { farmer: farmer })
+)
+
+(define-read-only (get-farmer-loyalty (farmer principal))
+    (map-get? farmer-loyalty { farmer: farmer })
+)
+
+(define-read-only (get-pending-refund (farmer principal))
+    (map-get? pending-refunds { farmer: farmer })
+)
+
+(define-private (calculate-refund-rate (farmer principal))
+    (let (
+            (loyalty-data (get-farmer-loyalty farmer))
+            (consecutive-periods (get consecutive-periods (unwrap! loyalty-data u0)))
+            (loyalty-bonus (if (>= (* consecutive-periods loyalty-bonus-increment)
+                    max-loyalty-bonus
+                )
+                max-loyalty-bonus
+                (* consecutive-periods loyalty-bonus-increment)
+            ))
+        )
+        (+ base-refund-rate loyalty-bonus)
+    )
+)
+
+(define-private (record-premium-payment
+        (farmer principal)
+        (amount uint)
+    )
+    (map-set policy-payments { farmer: farmer } {
+        premium-paid: amount,
+        payment-block: stacks-block-height,
+    })
+)
+
+(define-public (claim-premium-refund)
+    (let (
+            (policy (unwrap! (get-policy tx-sender) (err u29)))
+            (payment-data (unwrap! (get-policy-payment tx-sender) (err u30)))
+            (pending-refund (get-pending-refund tx-sender))
+            (has-filed-claim (is-some (get-farmer-active-claim tx-sender)))
+        )
+        (asserts! (not (get active policy)) (err u31))
+        (asserts! (> stacks-block-height (get end-block policy)) (err u32))
+        (asserts! (not has-filed-claim) (err u33))
+        (asserts! (is-none pending-refund) (err u34))
+        (let (
+                (refund-rate (calculate-refund-rate tx-sender))
+                (refund-amount (/ (* (get premium-paid payment-data) refund-rate) u100))
+                (loyalty-data (default-to {
+                    consecutive-periods: u0,
+                    total-refunds: u0,
+                    last-refund-block: u0,
+                }
+                    (get-farmer-loyalty tx-sender)
+                ))
+            )
+            (map-set pending-refunds { farmer: tx-sender } {
+                amount: refund-amount,
+                eligible-block: (+ stacks-block-height u144),
+                claimed: false,
+            })
+            (map-set farmer-loyalty { farmer: tx-sender } {
+                consecutive-periods: (+ (get consecutive-periods loyalty-data) u1),
+                total-refunds: (+ (get total-refunds loyalty-data) refund-amount),
+                last-refund-block: stacks-block-height,
+            })
+            (ok refund-amount)
+        )
+    )
+)
+
+(define-public (withdraw-refund)
+    (let ((refund-data (unwrap! (get-pending-refund tx-sender) (err u35))))
+        (asserts! (>= stacks-block-height (get eligible-block refund-data))
+            (err u36)
+        )
+        (asserts! (not (get claimed refund-data)) (err u37))
+        (try! (stx-transfer? (get amount refund-data) contract-owner tx-sender))
+        (map-set pending-refunds { farmer: tx-sender }
+            (merge refund-data { claimed: true })
+        )
+        (ok (get amount refund-data))
+    )
+)
+
+(define-private (get-farmer-active-claim (farmer principal))
+    (let ((current-nonce (var-get claim-nonce)))
+        (fold check-farmer-claim (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9) none)
+    )
+)
+
+(define-private (check-farmer-claim
+        (claim-id uint)
+        (found (optional uint))
+    )
+    (if (is-some found)
+        found
+        (match (get-claim claim-id)
+            some-claim (if (is-eq (get farmer some-claim) tx-sender)
+                (some claim-id)
+                none
+            )
+            none
+        )
+    )
+)
+
+(define-read-only (get-refund-eligibility (farmer principal))
+    (let (
+            (policy (get-policy farmer))
+            (payment-data (get-policy-payment farmer))
+            (loyalty-data (get-farmer-loyalty farmer))
+            (loyalty-periods (default-to u0 (get consecutive-periods loyalty-data)))
+        )
+        (ok {
+            eligible: (and (is-some policy) (is-some payment-data)),
+            refund-rate: (calculate-refund-rate farmer),
+            loyalty-periods: loyalty-periods,
+            estimated-refund: (if (and (is-some policy) (is-some payment-data))
+                (/
+                    (* (get premium-paid (unwrap-panic payment-data))
+                        (calculate-refund-rate farmer)
+                    )
+                    u100
+                )
+                u0
+            ),
+        })
+    )
+)
+(define-constant weather-update-frequency u144)
+(define-constant premium-adjustment-cap u50)
+(define-constant alert-threshold-high-temp u40)
+(define-constant alert-threshold-low-rainfall u50)
+
+(define-data-var last-weather-update uint u0)
+(define-data-var current-weather-score uint u100)
+
+(define-map weather-history
+    { update-id: uint }
+    {
+        temperature: uint,
+        rainfall: uint,
+        timestamp: uint,
+        risk-score: uint,
+    }
+)
+
+(define-map policy-adjustments
+    { farmer: principal }
+    {
+        original-premium: uint,
+        current-premium: uint,
+        adjustment-count: uint,
+        last-adjustment: uint,
+    }
+)
+
+(define-map weather-alerts
+    { alert-id: uint }
+    {
+        alert-type: uint,
+        severity: uint,
+        issued-at: uint,
+        expires-at: uint,
+        active: bool,
+    }
+)
+
+(define-data-var weather-update-nonce uint u0)
+(define-data-var alert-nonce uint u0)
+
+(define-read-only (get-weather-history (update-id uint))
+    (map-get? weather-history { update-id: update-id })
+)
+
+(define-read-only (get-policy-adjustment (farmer principal))
+    (map-get? policy-adjustments { farmer: farmer })
+)
+
+(define-read-only (get-weather-alert (alert-id uint))
+    (map-get? weather-alerts { alert-id: alert-id })
+)
+
+(define-read-only (get-current-weather-score)
+    (var-get current-weather-score)
+)
+
+(define-private (calculate-weather-risk-score
+        (temperature uint)
+        (rainfall uint)
+    )
+    (let (
+            (temp-risk (if (> temperature (var-get threshold-temperature))
+                (- temperature (var-get threshold-temperature))
+                u0
+            ))
+            (rain-risk (if (< rainfall (var-get min-rainfall))
+                (- (var-get min-rainfall) rainfall)
+                u0
+            ))
+        )
+        (+ u100 temp-risk rain-risk)
+    )
+)
+
+(define-private (calculate-premium-adjustment (risk-score uint))
+    (let ((adjustment (if (> risk-score u120)
+            (if (< (- risk-score u100) premium-adjustment-cap)
+                (- risk-score u100)
+                premium-adjustment-cap
+            )
+            (if (< risk-score u80)
+                (if (> (- u100 risk-score) premium-adjustment-cap)
+                    (- u100 risk-score)
+                    premium-adjustment-cap
+                )
+                u0
+            )
+        )))
+        adjustment
+    )
+)
+
+(define-public (update-weather-conditions
+        (temperature uint)
+        (rainfall uint)
+    )
+    (let (
+            (current-nonce (var-get weather-update-nonce))
+            (risk-score (calculate-weather-risk-score temperature rainfall))
+        )
+        (asserts! (is-eq tx-sender oracle-address) (err u4))
+        (asserts!
+            (>= (- stacks-block-height (var-get last-weather-update))
+                weather-update-frequency
+            )
+            (err u38)
+        )
+        (map-set weather-history { update-id: current-nonce } {
+            temperature: temperature,
+            rainfall: rainfall,
+            timestamp: stacks-block-height,
+            risk-score: risk-score,
+        })
+        (var-set weather-update-nonce (+ current-nonce u1))
+        (var-set last-weather-update stacks-block-height)
+        (var-set current-weather-score risk-score)
+        (unwrap! (check-and-issue-alerts temperature rainfall) (err u40))
+        (ok risk-score)
+    )
+)
+
+(define-private (check-and-issue-alerts
+        (temperature uint)
+        (rainfall uint)
+    )
+    (let ((current-alert-nonce (var-get alert-nonce)))
+        (if (> temperature alert-threshold-high-temp)
+            (begin
+                (map-set weather-alerts { alert-id: current-alert-nonce } {
+                    alert-type: u1,
+                    severity: (if (> temperature (+ alert-threshold-high-temp u10))
+                        u3
+                        u2
+                    ),
+                    issued-at: stacks-block-height,
+                    expires-at: (+ stacks-block-height u1008),
+                    active: true,
+                })
+                (var-set alert-nonce (+ current-alert-nonce u1))
+                (ok true)
+            )
+            (if (< rainfall alert-threshold-low-rainfall)
+                (begin
+                    (map-set weather-alerts { alert-id: current-alert-nonce } {
+                        alert-type: u2,
+                        severity: (if (< rainfall (- alert-threshold-low-rainfall u20))
+                            u3
+                            u2
+                        ),
+                        issued-at: stacks-block-height,
+                        expires-at: (+ stacks-block-height u1008),
+                        active: true,
+                    })
+                    (var-set alert-nonce (+ current-alert-nonce u1))
+                    (ok true)
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (apply-weather-adjustment)
+    (let (
+            (policy (unwrap! (get-policy tx-sender) (err u5)))
+            (current-adjustment (get-policy-adjustment tx-sender))
+            (weather-score (var-get current-weather-score))
+            (premium-change (calculate-premium-adjustment weather-score))
+        )
+        (asserts! (get active policy) (err u7))
+        (asserts! (<= stacks-block-height (get end-block policy)) (err u8))
+        (if (is-some current-adjustment)
+            (let (
+                    (adj-data (unwrap! current-adjustment (err u39)))
+                    (new-premium (+ (get current-premium adj-data) premium-change))
+                )
+                (map-set policy-adjustments { farmer: tx-sender } {
+                    original-premium: (get original-premium adj-data),
+                    current-premium: new-premium,
+                    adjustment-count: (+ (get adjustment-count adj-data) u1),
+                    last-adjustment: stacks-block-height,
+                })
+                (ok new-premium)
+            )
+            (let ((base-premium (/ (* (get amount policy) u5) u100)))
+                (map-set policy-adjustments { farmer: tx-sender } {
+                    original-premium: base-premium,
+                    current-premium: (+ base-premium premium-change),
+                    adjustment-count: u1,
+                    last-adjustment: stacks-block-height,
+                })
+                (ok (+ base-premium premium-change))
+            )
+        )
+    )
+)
+
+(define-read-only (get-active-alerts)
+    (let ((current-nonce (var-get alert-nonce)))
+        (filter-active-alerts (list u0 u1 u2 u3 u4))
+    )
+)
+
+(define-private (filter-active-alerts (alert-ids (list 5 uint)))
+    (map get-alert-if-active alert-ids)
+)
+
+(define-private (get-alert-if-active (alert-id uint))
+    (match (get-weather-alert alert-id)
+        some-alert (if (and (get active some-alert) (< stacks-block-height (get expires-at some-alert)))
+            (some {
+                alert-id: alert-id,
+                data: some-alert,
+            })
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (get-weather-forecast-impact (farmer principal))
+    (let (
+            (policy (get-policy farmer))
+            (adjustment (get-policy-adjustment farmer))
+            (weather-score (var-get current-weather-score))
+        )
+        (ok {
+            current-risk-score: weather-score,
+            premium-impact: (calculate-premium-adjustment weather-score),
+            has-active-policy: (is-some policy),
+            current-adjustment: adjustment,
+            recommendation: (if (> weather-score u130)
+                "high-risk"
+                (if (< weather-score u80)
+                    "low-risk"
+                    "normal-risk"
+                )
+            ),
+        })
+    )
+)
