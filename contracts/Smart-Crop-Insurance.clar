@@ -911,3 +911,212 @@
         })
     )
 )
+(define-constant transfer-fee-rate u2)
+(define-constant min-transfer-blocks u144)
+
+(define-map policy-transfers
+    { transfer-id: uint }
+    {
+        from-farmer: principal,
+        to-farmer: principal,
+        policy-amount: uint,
+        transfer-fee: uint,
+        initiated-at: uint,
+        expires-at: uint,
+        completed: bool,
+        cancelled: bool,
+    }
+)
+
+(define-map transfer-approvals
+    {
+        transfer-id: uint,
+        farmer: principal,
+    }
+    {
+        approved: bool,
+        approved-at: uint,
+    }
+)
+
+(define-data-var transfer-nonce uint u0)
+
+(define-read-only (get-policy-transfer (transfer-id uint))
+    (map-get? policy-transfers { transfer-id: transfer-id })
+)
+
+(define-read-only (get-transfer-approval
+        (transfer-id uint)
+        (farmer principal)
+    )
+    (map-get? transfer-approvals {
+        transfer-id: transfer-id,
+        farmer: farmer,
+    })
+)
+
+(define-private (calculate-transfer-fee (policy-amount uint))
+    (/ (* policy-amount transfer-fee-rate) u100)
+)
+
+(define-public (initiate-policy-transfer (to-farmer principal))
+    (let (
+            (policy (unwrap! (get-policy tx-sender) (err u41)))
+            (current-nonce (var-get transfer-nonce))
+            (transfer-fee (calculate-transfer-fee (get amount policy)))
+        )
+        (asserts! (get active policy) (err u7))
+        (asserts!
+            (< (+ stacks-block-height min-transfer-blocks) (get end-block policy))
+            (err u42)
+        )
+        (asserts! (not (is-eq tx-sender to-farmer)) (err u43))
+        (asserts! (is-eq (get-policy to-farmer) none) (err u44))
+        (var-set transfer-nonce (+ current-nonce u1))
+        (map-set policy-transfers { transfer-id: current-nonce } {
+            from-farmer: tx-sender,
+            to-farmer: to-farmer,
+            policy-amount: (get amount policy),
+            transfer-fee: transfer-fee,
+            initiated-at: stacks-block-height,
+            expires-at: (+ stacks-block-height u1008),
+            completed: false,
+            cancelled: false,
+        })
+        (map-set transfer-approvals {
+            transfer-id: current-nonce,
+            farmer: tx-sender,
+        } {
+            approved: true,
+            approved-at: stacks-block-height,
+        })
+        (ok current-nonce)
+    )
+)
+
+(define-public (approve-policy-transfer (transfer-id uint))
+    (let (
+            (transfer-data (unwrap! (get-policy-transfer transfer-id) (err u45)))
+            (existing-approval (get-transfer-approval transfer-id tx-sender))
+        )
+        (asserts! (is-eq tx-sender (get to-farmer transfer-data)) (err u46))
+        (asserts! (< stacks-block-height (get expires-at transfer-data))
+            (err u47)
+        )
+        (asserts! (not (get completed transfer-data)) (err u48))
+        (asserts! (not (get cancelled transfer-data)) (err u49))
+        (asserts! (is-none existing-approval) (err u50))
+        (try! (stx-transfer? (get transfer-fee transfer-data) tx-sender contract-owner))
+        (map-set transfer-approvals {
+            transfer-id: transfer-id,
+            farmer: tx-sender,
+        } {
+            approved: true,
+            approved-at: stacks-block-height,
+        })
+        (execute-policy-transfer transfer-id)
+    )
+)
+
+(define-private (execute-policy-transfer (transfer-id uint))
+    (let (
+            (transfer-data (unwrap! (get-policy-transfer transfer-id) (err u45)))
+            (from-policy (unwrap! (get-policy (get from-farmer transfer-data)) (err u51)))
+        )
+        (map-set policies { farmer: (get from-farmer transfer-data) }
+            (merge from-policy { active: false })
+        )
+        (map-set policies { farmer: (get to-farmer transfer-data) } {
+            amount: (get amount from-policy),
+            active: true,
+            start-block: (get start-block from-policy),
+            end-block: (get end-block from-policy),
+        })
+        (let (
+                (from-payment (get-policy-payment (get from-farmer transfer-data)))
+                (from-region (get-farmer-region (get from-farmer transfer-data)))
+            )
+            (if (is-some from-payment)
+                (map-set policy-payments { farmer: (get to-farmer transfer-data) }
+                    (unwrap-panic from-payment)
+                )
+                true
+            )
+            (if (is-some from-region)
+                (map-set farmer-regions { farmer: (get to-farmer transfer-data) }
+                    (unwrap-panic from-region)
+                )
+                true
+            )
+        )
+        (map-set policy-transfers { transfer-id: transfer-id }
+            (merge transfer-data { completed: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-policy-transfer (transfer-id uint))
+    (let ((transfer-data (unwrap! (get-policy-transfer transfer-id) (err u45))))
+        (asserts! (is-eq tx-sender (get from-farmer transfer-data)) (err u52))
+        (asserts! (not (get completed transfer-data)) (err u48))
+        (asserts! (not (get cancelled transfer-data)) (err u49))
+        (map-set policy-transfers { transfer-id: transfer-id }
+            (merge transfer-data { cancelled: true })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-pending-transfers (farmer principal))
+    (let ((current-nonce (var-get transfer-nonce)))
+        (filter-farmer-transfers farmer (list u0 u1 u2 u3 u4))
+    )
+)
+
+(define-private (filter-farmer-transfers
+        (farmer principal)
+        (transfer-ids (list 5 uint))
+    )
+    (map get-transfer-for-farmer transfer-ids)
+)
+
+(define-private (get-transfer-for-farmer (transfer-id uint))
+    (match (get-policy-transfer transfer-id)
+        some-transfer (if (or
+                (is-eq (get from-farmer some-transfer) tx-sender)
+                (is-eq (get to-farmer some-transfer) tx-sender)
+            )
+            (some {
+                transfer-id: transfer-id,
+                data: some-transfer,
+            })
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (get-transfer-details (transfer-id uint))
+    (let (
+            (transfer-data (get-policy-transfer transfer-id))
+            (from-approval (if (is-some transfer-data)
+                (get-transfer-approval transfer-id
+                    (get from-farmer (unwrap-panic transfer-data))
+                )
+                none
+            ))
+            (to-approval (if (is-some transfer-data)
+                (get-transfer-approval transfer-id
+                    (get to-farmer (unwrap-panic transfer-data))
+                )
+                none
+            ))
+        )
+        (ok {
+            transfer: transfer-data,
+            from-approval: from-approval,
+            to-approval: to-approval,
+        })
+    )
+)
