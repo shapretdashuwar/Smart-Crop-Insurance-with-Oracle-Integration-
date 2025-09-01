@@ -514,6 +514,7 @@
     {
         premium-paid: uint,
         payment-block: uint,
+        payment-count: uint,
     }
 )
 
@@ -523,6 +524,9 @@
         consecutive-periods: uint,
         total-refunds: uint,
         last-refund-block: uint,
+        total-periods: uint,
+        loyalty-score: uint,
+        first-policy-block: uint,
     }
 )
 
@@ -569,6 +573,7 @@
     (map-set policy-payments { farmer: farmer } {
         premium-paid: amount,
         payment-block: stacks-block-height,
+        payment-count: u1,
     })
 )
 
@@ -603,6 +608,9 @@
                 consecutive-periods: (+ (get consecutive-periods loyalty-data) u1),
                 total-refunds: (+ (get total-refunds loyalty-data) refund-amount),
                 last-refund-block: stacks-block-height,
+                total-periods: (+ (get consecutive-periods loyalty-data) u1),
+                loyalty-score: (* (get consecutive-periods loyalty-data) u10),
+                first-policy-block: stacks-block-height,
             })
             (ok refund-amount)
         )
@@ -941,6 +949,23 @@
 
 (define-data-var transfer-nonce uint u0)
 
+(define-constant renewal-window u1008)
+(define-constant loyalty-discount-threshold u3)
+(define-constant max-loyalty-discount u15)
+
+(define-map auto-renewal-settings
+    { farmer: principal }
+    {
+        enabled: bool,
+        max-premium: uint,
+        preferred-duration: uint,
+        region: uint,
+        last-renewal: uint,
+    }
+)
+
+(define-data-var renewal-nonce uint u0)
+
 (define-read-only (get-policy-transfer (transfer-id uint))
     (map-get? policy-transfers { transfer-id: transfer-id })
 )
@@ -1117,6 +1142,264 @@
             transfer: transfer-data,
             from-approval: from-approval,
             to-approval: to-approval,
+        })
+    )
+)
+
+(define-read-only (get-auto-renewal-settings (farmer principal))
+    (map-get? auto-renewal-settings { farmer: farmer })
+)
+
+(define-private (calculate-loyalty-discount (farmer principal))
+    (let (
+            (loyalty-data (get-farmer-loyalty farmer))
+            (consecutive-periods (default-to u0 (get consecutive-periods loyalty-data)))
+        )
+        (if (>= consecutive-periods loyalty-discount-threshold)
+            (let ((calculated-discount (* consecutive-periods u3)))
+                (if (< calculated-discount max-loyalty-discount)
+                    calculated-discount
+                    max-loyalty-discount
+                )
+            )
+            u0
+        )
+    )
+)
+
+(define-private (update-farmer-loyalty
+        (farmer principal)
+        (is-renewal bool)
+    )
+    (let (
+            (existing-loyalty (get-farmer-loyalty farmer))
+            (current-block stacks-block-height)
+        )
+        (if (is-some existing-loyalty)
+            (let ((loyalty-data (unwrap-panic existing-loyalty)))
+                (map-set farmer-loyalty { farmer: farmer } {
+                    consecutive-periods: (if is-renewal
+                        (+ (get consecutive-periods loyalty-data) u1)
+                        u1
+                    ),
+                    total-refunds: (get total-refunds loyalty-data),
+                    last-refund-block: (get last-refund-block loyalty-data),
+                    total-periods: (+ (get consecutive-periods loyalty-data) u1),
+                    loyalty-score: (* (get consecutive-periods loyalty-data) u10),
+                    first-policy-block: current-block,
+                })
+            )
+            (map-set farmer-loyalty { farmer: farmer } {
+                consecutive-periods: u1,
+                total-refunds: u0,
+                last-refund-block: u0,
+                total-periods: u1,
+                loyalty-score: u10,
+                first-policy-block: current-block,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-private (calculate-renewal-premium
+        (amount uint)
+        (region uint)
+        (farmer principal)
+    )
+    (let (
+            (base-premium (calculate-adjusted-premium amount region))
+            (loyalty-discount (calculate-loyalty-discount farmer))
+        )
+        (- base-premium (/ (* base-premium loyalty-discount) u100))
+    )
+)
+
+(define-public (setup-auto-renewal
+        (max-premium uint)
+        (preferred-duration uint)
+        (region uint)
+    )
+    (let ((policy (unwrap! (get-policy tx-sender) (err u5))))
+        (asserts! (get active policy) (err u7))
+        (asserts! (<= region u3) (err u14))
+        (asserts!
+            (and (>= preferred-duration u144) (<= preferred-duration u52560))
+            (err u53)
+        )
+        (map-set auto-renewal-settings { farmer: tx-sender } {
+            enabled: true,
+            max-premium: max-premium,
+            preferred-duration: preferred-duration,
+            region: region,
+            last-renewal: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-public (disable-auto-renewal)
+    (let ((settings (unwrap! (get-auto-renewal-settings tx-sender) (err u54))))
+        (map-set auto-renewal-settings { farmer: tx-sender }
+            (merge settings { enabled: false })
+        )
+        (ok true)
+    )
+)
+
+(define-public (execute-auto-renewal (farmer principal))
+    (let (
+            (policy (unwrap! (get-policy farmer) (err u5)))
+            (renewal-settings (unwrap! (get-auto-renewal-settings farmer) (err u54)))
+            (blocks-until-expiry (- (get end-block policy) stacks-block-height))
+        )
+        (asserts! (get enabled renewal-settings) (err u55))
+        (asserts! (get active policy) (err u7))
+        (asserts! (<= blocks-until-expiry renewal-window) (err u56))
+        (let ((renewal-premium (calculate-renewal-premium (get amount policy)
+                (get region renewal-settings) farmer
+            )))
+            (asserts! (<= renewal-premium (get max-premium renewal-settings))
+                (err u57)
+            )
+            (try! (stx-transfer? renewal-premium farmer contract-owner))
+            (map-set policy-payments { farmer: farmer } {
+                premium-paid: renewal-premium,
+                payment-block: stacks-block-height,
+                payment-count: (+
+                    (default-to u0
+                        (get payment-count (get-policy-payment farmer))
+                    )
+                    u1
+                ),
+            })
+            (unwrap! (update-farmer-loyalty farmer true) (err u58))
+            (map-set policies { farmer: farmer } {
+                amount: (get amount policy),
+                active: true,
+                start-block: (get end-block policy),
+                end-block: (+ (get end-block policy)
+                    (get preferred-duration renewal-settings)
+                ),
+            })
+            (map-set auto-renewal-settings { farmer: farmer }
+                (merge renewal-settings { last-renewal: stacks-block-height })
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (manual-renew-policy
+        (amount uint)
+        (duration uint)
+        (region uint)
+    )
+    (let (
+            (existing-policy (get-policy tx-sender))
+            (renewal-premium (calculate-renewal-premium amount region tx-sender))
+        )
+        (asserts! (>= amount min-insurance-amount) (err u1))
+        (asserts! (<= amount max-insurance-amount) (err u2))
+        (asserts! (<= region u3) (err u14))
+        (if (is-some existing-policy)
+            (let (
+                    (policy (unwrap-panic existing-policy))
+                    (blocks-until-expiry (- (get end-block policy) stacks-block-height))
+                )
+                (asserts! (<= blocks-until-expiry renewal-window) (err u56))
+                (try! (stx-transfer? renewal-premium tx-sender contract-owner))
+                (map-set policy-payments { farmer: tx-sender } {
+                    premium-paid: renewal-premium,
+                    payment-block: stacks-block-height,
+                    payment-count: (+
+                        (default-to u1
+                            (get payment-count (get-policy-payment tx-sender))
+                        )
+                        u1
+                    ),
+                })
+                (unwrap! (update-farmer-loyalty tx-sender true) (err u58))
+                (map-set policies { farmer: tx-sender } {
+                    amount: amount,
+                    active: true,
+                    start-block: (get end-block policy),
+                    end-block: (+ (get end-block policy) duration),
+                })
+                (ok true)
+            )
+            (begin
+                (try! (stx-transfer? renewal-premium tx-sender contract-owner))
+                (map-set policy-payments { farmer: tx-sender } {
+                    premium-paid: renewal-premium,
+                    payment-block: stacks-block-height,
+                    payment-count: u1,
+                })
+                (unwrap! (update-farmer-loyalty tx-sender false) (err u58))
+                (map-set policies { farmer: tx-sender } {
+                    amount: amount,
+                    active: true,
+                    start-block: stacks-block-height,
+                    end-block: (+ stacks-block-height duration),
+                })
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-read-only (get-renewal-quote
+        (farmer principal)
+        (amount uint)
+        (region uint)
+    )
+    (let (
+            (base-premium (calculate-adjusted-premium amount region))
+            (loyalty-discount (calculate-loyalty-discount farmer))
+            (final-premium (- base-premium (/ (* base-premium loyalty-discount) u100)))
+        )
+        (ok {
+            base-premium: base-premium,
+            loyalty-discount: loyalty-discount,
+            final-premium: final-premium,
+            eligible-for-auto: (and
+                (is-some (get-policy farmer))
+                (is-some (get-auto-renewal-settings farmer))
+            ),
+        })
+    )
+)
+
+(define-read-only (check-renewal-eligibility (farmer principal))
+    (let (
+            (policy (get-policy farmer))
+            (renewal-settings (get-auto-renewal-settings farmer))
+        )
+        (ok {
+            has-active-policy: (is-some policy),
+            auto-renewal-enabled: (and
+                (is-some renewal-settings)
+                (get enabled
+                    (default-to {
+                        enabled: false,
+                        max-premium: u0,
+                        preferred-duration: u0,
+                        region: u0,
+                        last-renewal: u0,
+                    }
+                        renewal-settings
+                    ))
+            ),
+            blocks-until-expiry: (if (is-some policy)
+                (- (get end-block (unwrap-panic policy)) stacks-block-height)
+                u0
+            ),
+            within-renewal-window: (if (is-some policy)
+                (<= (- (get end-block (unwrap-panic policy)) stacks-block-height)
+                    renewal-window
+                )
+                false
+            ),
         })
     )
 )
