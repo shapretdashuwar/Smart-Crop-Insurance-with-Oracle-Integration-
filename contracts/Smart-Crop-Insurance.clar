@@ -1403,3 +1403,393 @@
         })
     )
 )
+
+;; =============================================================================
+;; FRAUD DETECTION AND PREVENTION SYSTEM
+;; =============================================================================
+
+(define-constant fraud-score-threshold u70)
+(define-constant max-fraud-incidents u5)
+(define-constant suspicious-claim-frequency u3)
+(define-constant rapid-policy-threshold u48)
+
+(define-data-var fraud-detection-enabled bool true)
+(define-data-var fraud-incident-nonce uint u0)
+
+(define-map fraud-scores
+    { farmer: principal }
+    {
+        base-score: uint,
+        incident-count: uint,
+        last-updated: uint,
+        flagged: bool,
+        review-required: bool,
+    }
+)
+
+(define-map fraud-incidents
+    { incident-id: uint }
+    {
+        farmer: principal,
+        incident-type: uint,
+        severity: uint,
+        detected-at: uint,
+        description: (string-ascii 64),
+        resolved: bool,
+    }
+)
+
+(define-map farmer-activity-patterns
+    { farmer: principal }
+    {
+        policy-count: uint,
+        claim-count: uint,
+        first-policy-date: uint,
+        last-activity: uint,
+        rapid-purchases: uint,
+        consecutive-claims: uint,
+    }
+)
+
+(define-map suspicious-activities
+    { activity-id: uint }
+    {
+        farmer: principal,
+        activity-type: uint,
+        risk-level: uint,
+        timestamp: uint,
+        auto-generated: bool,
+    }
+)
+
+(define-data-var activity-nonce uint u0)
+
+;; Incident types
+(define-constant incident-rapid-claims u1)
+(define-constant incident-pattern-mismatch u2)
+(define-constant incident-weather-inconsistency u3)
+(define-constant incident-multiple-policies u4)
+(define-constant incident-suspicious-timing u5)
+
+;; Read-only functions
+(define-read-only (get-fraud-score (farmer principal))
+    (map-get? fraud-scores { farmer: farmer })
+)
+
+(define-read-only (get-fraud-incident (incident-id uint))
+    (map-get? fraud-incidents { incident-id: incident-id })
+)
+
+(define-read-only (get-farmer-activity-pattern (farmer principal))
+    (map-get? farmer-activity-patterns { farmer: farmer })
+)
+
+(define-read-only (get-suspicious-activity (activity-id uint))
+    (map-get? suspicious-activities { activity-id: activity-id })
+)
+
+(define-read-only (is-farmer-flagged (farmer principal))
+    (match (get-fraud-score farmer)
+        some-score (get flagged some-score)
+        false
+    )
+)
+
+;; Private helper functions
+(define-private (calculate-base-fraud-score (farmer principal))
+    (let (
+            (activity (get-farmer-activity-pattern farmer))
+            (policy-data (get-policy farmer))
+            (current-block stacks-block-height)
+        )
+        (if (is-some activity)
+            (let (
+                    (activity-data (unwrap-panic activity))
+                    (policy-frequency-score (if (> (get policy-count activity-data) u3) u20 u0))
+                    (claim-frequency-score (if (> (get claim-count activity-data) u2) u25 u0))
+                    (rapid-purchase-score (* (get rapid-purchases activity-data) u15))
+                    (consecutive-claim-score (* (get consecutive-claims activity-data) u20))
+                )
+                (+ policy-frequency-score claim-frequency-score rapid-purchase-score consecutive-claim-score)
+            )
+            u0
+        )
+    )
+)
+
+(define-private (update-activity-pattern
+        (farmer principal)
+        (activity-type uint)
+    )
+    (let (
+            (existing-pattern (get-farmer-activity-pattern farmer))
+            (current-block stacks-block-height)
+        )
+        (if (is-some existing-pattern)
+            (let ((pattern-data (unwrap-panic existing-pattern)))
+                (map-set farmer-activity-patterns { farmer: farmer }
+                    (merge pattern-data {
+                        last-activity: current-block,
+                        policy-count: (if (is-eq activity-type u1)
+                            (+ (get policy-count pattern-data) u1)
+                            (get policy-count pattern-data)
+                        ),
+                        claim-count: (if (is-eq activity-type u2)
+                            (+ (get claim-count pattern-data) u1)
+                            (get claim-count pattern-data)
+                        ),
+                        rapid-purchases: (if (and
+                                (is-eq activity-type u1)
+                                (< (- current-block (get last-activity pattern-data)) rapid-policy-threshold)
+                            )
+                            (+ (get rapid-purchases pattern-data) u1)
+                            (get rapid-purchases pattern-data)
+                        ),
+                        consecutive-claims: (if (and
+                                (is-eq activity-type u2)
+                                (< (- current-block (get last-activity pattern-data)) u1008)
+                            )
+                            (+ (get consecutive-claims pattern-data) u1)
+                            u0
+                        ),
+                    })
+                )
+                (ok true)
+            )
+            (begin
+                (map-set farmer-activity-patterns { farmer: farmer } {
+                    policy-count: (if (is-eq activity-type u1) u1 u0),
+                    claim-count: (if (is-eq activity-type u2) u1 u0),
+                    first-policy-date: current-block,
+                    last-activity: current-block,
+                    rapid-purchases: u0,
+                    consecutive-claims: u0,
+                })
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (detect-suspicious-patterns (farmer principal))
+    (let (
+            (fraud-score-data (get-fraud-score farmer))
+            (activity-pattern (get-farmer-activity-pattern farmer))
+            (current-nonce (var-get activity-nonce))
+        )
+        (if (and (is-some activity-pattern) (var-get fraud-detection-enabled))
+            (let (
+                    (pattern (unwrap-panic activity-pattern))
+                    (rapid-purchases (get rapid-purchases pattern))
+                    (consecutive-claims (get consecutive-claims pattern))
+                    (claim-frequency (get claim-count pattern))
+                )
+                (if (or
+                        (>= rapid-purchases u2)
+                        (>= consecutive-claims suspicious-claim-frequency)
+                        (>= claim-frequency u4)
+                    )
+                    (begin
+                        (map-set suspicious-activities { activity-id: current-nonce } {
+                            farmer: farmer,
+                            activity-type: (if (>= rapid-purchases u2) u1 u2),
+                            risk-level: (if (>= consecutive-claims u3) u3 u2),
+                            timestamp: stacks-block-height,
+                            auto-generated: true,
+                        })
+                        (var-set activity-nonce (+ current-nonce u1))
+                        (ok true)
+                    )
+                    (ok false)
+                )
+            )
+            (ok false)
+        )
+    )
+)
+
+(define-private (update-fraud-score (farmer principal))
+    (let (
+            (base-score (calculate-base-fraud-score farmer))
+            (existing-fraud-data (get-fraud-score farmer))
+            (current-block stacks-block-height)
+        )
+        (if (is-some existing-fraud-data)
+            (let ((fraud-data (unwrap-panic existing-fraud-data)))
+                (map-set fraud-scores { farmer: farmer }
+                    (merge fraud-data {
+                        base-score: base-score,
+                        last-updated: current-block,
+                        flagged: (>= base-score fraud-score-threshold),
+                        review-required: (>= base-score (+ fraud-score-threshold u20)),
+                    })
+                )
+            )
+            (map-set fraud-scores { farmer: farmer } {
+                base-score: base-score,
+                incident-count: u0,
+                last-updated: current-block,
+                flagged: (>= base-score fraud-score-threshold),
+                review-required: (>= base-score (+ fraud-score-threshold u20)),
+            })
+        )
+        (ok base-score)
+    )
+)
+
+(define-private (record-fraud-incident
+        (farmer principal)
+        (incident-type uint)
+        (severity uint)
+        (description (string-ascii 64))
+    )
+    (let (
+            (current-nonce (var-get fraud-incident-nonce))
+            (fraud-data (get-fraud-score farmer))
+        )
+        (map-set fraud-incidents { incident-id: current-nonce } {
+            farmer: farmer,
+            incident-type: incident-type,
+            severity: severity,
+            detected-at: stacks-block-height,
+            description: description,
+            resolved: false,
+        })
+        (var-set fraud-incident-nonce (+ current-nonce u1))
+        (if (is-some fraud-data)
+            (let ((existing-data (unwrap-panic fraud-data)))
+                (map-set fraud-scores { farmer: farmer }
+                    (merge existing-data {
+                        incident-count: (+ (get incident-count existing-data) u1),
+                        flagged: true,
+                        review-required: (>= severity u3),
+                    })
+                )
+            )
+            (map-set fraud-scores { farmer: farmer } {
+                base-score: (* severity u25),
+                incident-count: u1,
+                last-updated: stacks-block-height,
+                flagged: true,
+                review-required: (>= severity u3),
+            })
+        )
+        (ok current-nonce)
+    )
+)
+
+;; Public functions for fraud detection integration
+(define-public (check-fraud-before-policy-purchase (farmer principal))
+    (let ((fraud-data (get-fraud-score farmer)))
+        (if (is-some fraud-data)
+            (let ((score-data (unwrap-panic fraud-data)))
+                (if (get flagged score-data)
+                    (err u59) ;; Fraud flag prevents policy purchase
+                    (begin
+                        (unwrap! (update-activity-pattern farmer u1) (err u60))
+                        (unwrap! (update-fraud-score farmer) (err u61))
+                        (unwrap! (detect-suspicious-patterns farmer) (err u62))
+                        (ok true)
+                    )
+                )
+            )
+            (begin
+                (unwrap! (update-activity-pattern farmer u1) (err u60))
+                (unwrap! (update-fraud-score farmer) (err u61))
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (check-fraud-before-claim (farmer principal))
+    (let (
+            (fraud-data (get-fraud-score farmer))
+            (activity-pattern (get-farmer-activity-pattern farmer))
+        )
+        (if (is-some fraud-data)
+            (let ((score-data (unwrap-panic fraud-data)))
+                (if (get flagged score-data)
+                    (begin
+                        (unwrap! (record-fraud-incident farmer incident-rapid-claims u3 "Flagged farmer attempting claim") (err u63))
+                        (err u64) ;; Fraud flag prevents claim
+                    )
+                    (begin
+                        (unwrap! (update-activity-pattern farmer u2) (err u60))
+                        (unwrap! (update-fraud-score farmer) (err u61))
+                        (unwrap! (detect-suspicious-patterns farmer) (err u62))
+                        (ok true)
+                    )
+                )
+            )
+            (begin
+                (unwrap! (update-activity-pattern farmer u2) (err u60))
+                (unwrap! (update-fraud-score farmer) (err u61))
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (admin-resolve-fraud-incident (incident-id uint))
+    (let ((incident (unwrap! (get-fraud-incident incident-id) (err u65))))
+        (asserts! (is-eq tx-sender contract-owner) (err u17))
+        (asserts! (not (get resolved incident)) (err u66))
+        (map-set fraud-incidents { incident-id: incident-id }
+            (merge incident { resolved: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (admin-clear-fraud-flag (farmer principal))
+    (let ((fraud-data (unwrap! (get-fraud-score farmer) (err u67))))
+        (asserts! (is-eq tx-sender contract-owner) (err u17))
+        (map-set fraud-scores { farmer: farmer }
+            (merge fraud-data {
+                flagged: false,
+                review-required: false,
+                base-score: u0,
+                incident-count: u0,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (admin-toggle-fraud-detection (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err u17))
+        (var-set fraud-detection-enabled enabled)
+        (ok enabled)
+    )
+)
+
+;; Read-only functions for fraud analysis
+(define-read-only (get-fraud-summary (farmer principal))
+    (let (
+            (fraud-data (get-fraud-score farmer))
+            (activity-pattern (get-farmer-activity-pattern farmer))
+        )
+        (ok {
+            fraud-score: fraud-data,
+            activity-pattern: activity-pattern,
+            is-flagged: (is-farmer-flagged farmer),
+            detection-enabled: (var-get fraud-detection-enabled),
+        })
+    )
+)
+
+(define-read-only (get-fraud-statistics)
+    (let (
+            (total-incidents (var-get fraud-incident-nonce))
+            (total-activities (var-get activity-nonce))
+        )
+        (ok {
+            total-fraud-incidents: total-incidents,
+            total-suspicious-activities: total-activities,
+            detection-enabled: (var-get fraud-detection-enabled),
+            threshold: fraud-score-threshold,
+        })
+    )
+)
