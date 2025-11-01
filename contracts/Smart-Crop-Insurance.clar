@@ -29,12 +29,36 @@
 
 (define-data-var claim-nonce uint u0)
 
+(define-map policy-beneficiaries
+    { farmer: principal }
+    { beneficiary: principal }
+)
+
 (define-read-only (get-policy (farmer principal))
     (map-get? policies { farmer: farmer })
 )
 
 (define-read-only (get-claim (claim-id uint))
     (map-get? claims { claim-id: claim-id })
+)
+
+(define-read-only (get-beneficiary (farmer principal))
+    (map-get? policy-beneficiaries { farmer: farmer })
+)
+
+(define-public (set-beneficiary (beneficiary principal))
+    (begin
+        (map-set policy-beneficiaries { farmer: tx-sender } { beneficiary: beneficiary })
+        (ok true)
+    )
+)
+
+(define-private (payout-recipient (farmer principal))
+    (let ((entry (default-to { beneficiary: farmer }
+            (map-get? policy-beneficiaries { farmer: farmer })
+        )))
+        (get beneficiary entry)
+    )
 )
 
 (define-public (purchase-insurance
@@ -104,7 +128,7 @@
             )
             (begin
                 (try! (stx-transfer? (get amount claim) contract-owner
-                    (get farmer claim)
+                    (payout-recipient (get farmer claim))
                 ))
                 (map-set claims { claim-id: claim-id }
                     (merge claim { processed: true })
@@ -470,7 +494,7 @@
             )
             (begin
                 (try! (stx-transfer? (get amount claim) contract-owner
-                    (get farmer claim)
+                    (payout-recipient (get farmer claim))
                 ))
                 (map-set claims { claim-id: claim-id }
                     (merge claim { processed: true })
@@ -500,7 +524,9 @@
     (let ((claim (unwrap! (get-claim claim-id) (err u26))))
         (asserts! (is-eq tx-sender contract-owner) (err u17))
         (asserts! (not (get processed claim)) (err u28))
-        (try! (stx-transfer? (get amount claim) contract-owner (get farmer claim)))
+        (try! (stx-transfer? (get amount claim) contract-owner
+            (payout-recipient (get farmer claim))
+        ))
         (map-set claims { claim-id: claim-id } (merge claim { processed: true }))
         (ok true)
     )
@@ -1505,12 +1531,20 @@
         (if (is-some activity)
             (let (
                     (activity-data (unwrap-panic activity))
-                    (policy-frequency-score (if (> (get policy-count activity-data) u3) u20 u0))
-                    (claim-frequency-score (if (> (get claim-count activity-data) u2) u25 u0))
+                    (policy-frequency-score (if (> (get policy-count activity-data) u3)
+                        u20
+                        u0
+                    ))
+                    (claim-frequency-score (if (> (get claim-count activity-data) u2)
+                        u25
+                        u0
+                    ))
                     (rapid-purchase-score (* (get rapid-purchases activity-data) u15))
                     (consecutive-claim-score (* (get consecutive-claims activity-data) u20))
                 )
-                (+ policy-frequency-score claim-frequency-score rapid-purchase-score consecutive-claim-score)
+                (+ policy-frequency-score claim-frequency-score
+                    rapid-purchase-score consecutive-claim-score
+                )
             )
             u0
         )
@@ -1540,14 +1574,24 @@
                         ),
                         rapid-purchases: (if (and
                                 (is-eq activity-type u1)
-                                (< (- current-block (get last-activity pattern-data)) rapid-policy-threshold)
+                                (<
+                                    (- current-block
+                                        (get last-activity pattern-data)
+                                    )
+                                    rapid-policy-threshold
+                                )
                             )
                             (+ (get rapid-purchases pattern-data) u1)
                             (get rapid-purchases pattern-data)
                         ),
                         consecutive-claims: (if (and
                                 (is-eq activity-type u2)
-                                (< (- current-block (get last-activity pattern-data)) u1008)
+                                (<
+                                    (- current-block
+                                        (get last-activity pattern-data)
+                                    )
+                                    u1008
+                                )
                             )
                             (+ (get consecutive-claims pattern-data) u1)
                             u0
@@ -1558,8 +1602,14 @@
             )
             (begin
                 (map-set farmer-activity-patterns { farmer: farmer } {
-                    policy-count: (if (is-eq activity-type u1) u1 u0),
-                    claim-count: (if (is-eq activity-type u2) u1 u0),
+                    policy-count: (if (is-eq activity-type u1)
+                        u1
+                        u0
+                    ),
+                    claim-count: (if (is-eq activity-type u2)
+                        u1
+                        u0
+                    ),
                     first-policy-date: current-block,
                     last-activity: current-block,
                     rapid-purchases: u0,
@@ -1592,8 +1642,14 @@
                     (begin
                         (map-set suspicious-activities { activity-id: current-nonce } {
                             farmer: farmer,
-                            activity-type: (if (>= rapid-purchases u2) u1 u2),
-                            risk-level: (if (>= consecutive-claims u3) u3 u2),
+                            activity-type: (if (>= rapid-purchases u2)
+                                u1
+                                u2
+                            ),
+                            risk-level: (if (>= consecutive-claims u3)
+                                u3
+                                u2
+                            ),
                             timestamp: stacks-block-height,
                             auto-generated: true,
                         })
@@ -1711,7 +1767,12 @@
             (let ((score-data (unwrap-panic fraud-data)))
                 (if (get flagged score-data)
                     (begin
-                        (unwrap! (record-fraud-incident farmer incident-rapid-claims u3 "Flagged farmer attempting claim") (err u63))
+                        (unwrap!
+                            (record-fraud-incident farmer incident-rapid-claims
+                                u3 "Flagged farmer attempting claim"
+                            )
+                            (err u63)
+                        )
                         (err u64) ;; Fraud flag prevents claim
                     )
                     (begin
